@@ -260,10 +260,9 @@ impl WorkerRegistry {
         self.model_index
             .entry(model_id.clone())
             .and_modify(|existing| {
-                // Create new snapshot with the additional worker and maintain deterministic order
+                // Create new snapshot with the additional worker
                 let mut new_workers: Vec<Arc<dyn Worker>> = existing.iter().cloned().collect();
                 new_workers.push(worker.clone());
-                new_workers.sort_by(|a, b| a.url().cmp(b.url()));
                 *existing = Arc::from(new_workers.into_boxed_slice());
             })
             .or_insert_with(|| Arc::from(vec![worker.clone()].into_boxed_slice()));
@@ -395,15 +394,10 @@ impl WorkerRegistry {
 
     /// Get all workers by worker type
     pub fn get_by_type(&self, worker_type: &WorkerType) -> Vec<Arc<dyn Worker>> {
-        let mut workers: Vec<Arc<dyn Worker>> = self.type_workers
+        self.type_workers
             .get(worker_type)
             .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
-            .unwrap_or_default();
-
-        // Enforce deterministic sorting by URL for consistent worker ordering
-        workers.sort_by(|a, b| a.url().cmp(b.url()));
-
-        workers
+            .unwrap_or_default()
     }
 
     /// Update worker health status and sync to mesh
@@ -427,7 +421,7 @@ impl WorkerRegistry {
 
     /// Get all prefill workers (regardless of bootstrap_port)
     pub fn get_prefill_workers(&self) -> Vec<Arc<dyn Worker>> {
-        let mut workers: Vec<Arc<dyn Worker>> = self.workers
+        self.workers
             .iter()
             .filter_map(|entry| {
                 let worker = entry.value();
@@ -436,46 +430,20 @@ impl WorkerRegistry {
                     _ => None,
                 }
             })
-            .collect();
-
-        // Enforce deterministic sorting by URL to handle K8s pod out-of-order issues
-        // and ensure consistent worker selection across multiple registry instances.
-        workers.sort_by(|a, b| a.url().cmp(b.url()));
-
-        workers
+            .collect()
     }
 
     /// Get all decode workers
     pub fn get_decode_workers(&self) -> Vec<Arc<dyn Worker>> {
-        let mut workers: Vec<Arc<dyn Worker>> = self.workers
-            .iter()
-            .filter_map(|entry| {
-                let worker = entry.value();
-                match worker.worker_type() {
-                    WorkerType::Decode => Some(worker.clone()),
-                    _ => None,
-                }
-            })
-            .collect();
-
-        // Enforce deterministic sorting by URL to handle K8s pod out-of-order issues
-        // and ensure consistent worker selection across multiple registry instances.
-        workers.sort_by(|a, b| a.url().cmp(b.url()));
-
-        workers
+        self.get_by_type(&WorkerType::Decode)
     }
 
     /// Get all workers by connection mode
     pub fn get_by_connection(&self, connection_mode: &ConnectionMode) -> Vec<Arc<dyn Worker>> {
-        let mut workers: Vec<Arc<dyn Worker>> = self.connection_workers
+        self.connection_workers
             .get(connection_mode)
             .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
-            .unwrap_or_default();
-
-        // Enforce deterministic sorting by URL for consistent worker ordering
-        workers.sort_by(|a, b| a.url().cmp(b.url()));
-
-        workers
+            .unwrap_or_default()
     }
 
     /// Get the number of workers in the registry
@@ -490,15 +458,10 @@ impl WorkerRegistry {
 
     /// Get all workers
     pub fn get_all(&self) -> Vec<Arc<dyn Worker>> {
-        let mut workers: Vec<Arc<dyn Worker>> = self.workers
+        self.workers
             .iter()
             .map(|entry| entry.value().clone())
-            .collect();
-
-        // Enforce deterministic sorting by URL for consistent worker ordering
-        workers.sort_by(|a, b| a.url().cmp(b.url()));
-
-        workers
+            .collect()
     }
 
     /// Get all workers with their IDs
@@ -511,15 +474,10 @@ impl WorkerRegistry {
 
     /// Get all worker URLs
     pub fn get_all_urls(&self) -> Vec<String> {
-        let mut urls: Vec<String> = self.workers
+        self.workers
             .iter()
             .map(|entry| entry.value().url().to_string())
-            .collect();
-
-        // Enforce deterministic sorting for consistent URL lists
-        urls.sort();
-
-        urls
+            .collect()
     }
 
     pub fn get_all_urls_with_api_key(&self) -> Vec<(String, Option<String>)> {
@@ -568,7 +526,7 @@ impl WorkerRegistry {
         };
 
         // Apply remaining filters
-        let mut filtered_workers: Vec<Arc<dyn Worker>> = workers
+        workers
             .into_iter()
             .filter(|w| {
                 // Check worker_type if specified
@@ -599,13 +557,7 @@ impl WorkerRegistry {
 
                 true
             })
-            .collect();
-
-        // Enforce deterministic sorting by URL to handle K8s pod out-of-order issues
-        // and ensure consistent worker selection across multiple registry instances.
-        filtered_workers.sort_by(|a, b| a.url().cmp(b.url()));
-
-        filtered_workers
+            .collect()
     }
 
     /// Get worker statistics (lock-free)
