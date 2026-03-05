@@ -421,7 +421,7 @@ impl WorkerRegistry {
 
     /// Get all prefill workers (regardless of bootstrap_port)
     pub fn get_prefill_workers(&self) -> Vec<Arc<dyn Worker>> {
-        self.workers
+        let workers_raw: Vec<Arc<dyn Worker>> = self.workers
             .iter()
             .filter_map(|entry| {
                 let worker = entry.value();
@@ -430,12 +430,43 @@ impl WorkerRegistry {
                     _ => None,
                 }
             })
-            .collect()
+            .collect();
+
+        // 记录原始顺序
+        let raw: Vec<String> = workers_raw.iter().map(|w| w.url().to_string()).collect();
+        let mut workers = workers_raw;
+        // 强制排序保证一致性
+        workers.sort_by(|a, b| a.url().cmp(b.url()));
+        // 记录排序结果
+        let sorted: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
+        tracing::debug!("Prefill Workers: Raw={:?} -> Sorted={:?}", raw, sorted);
+
+        workers
     }
 
     /// Get all decode workers
     pub fn get_decode_workers(&self) -> Vec<Arc<dyn Worker>> {
-        self.get_by_type(&WorkerType::Decode)
+        let workers_raw: Vec<Arc<dyn Worker>> = self.workers
+            .iter()
+            .filter_map(|entry| {
+                let worker = entry.value();
+                match worker.worker_type() {
+                    WorkerType::Decode => Some(worker.clone()),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        // 记录原始顺序
+        let raw: Vec<String> = workers_raw.iter().map(|w| w.url().to_string()).collect();
+        let mut workers = workers_raw;
+        // 强制排序
+        workers.sort_by(|a, b| a.url().cmp(b.url()));
+        // 记录排序结果
+        let sorted: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
+        tracing::debug!("Decode Workers: Raw={:?} -> Sorted={:?}", raw, sorted);
+
+        workers
     }
 
     /// Get all workers by connection mode
@@ -526,7 +557,7 @@ impl WorkerRegistry {
         };
 
         // Apply remaining filters
-        workers
+        let workers_raw: Vec<Arc<dyn Worker>> = workers
             .into_iter()
             .filter(|w| {
                 // Check worker_type if specified
@@ -557,7 +588,20 @@ impl WorkerRegistry {
 
                 true
             })
-            .collect()
+            .collect();
+
+        // 记录原始顺序
+        let raw: Vec<String> = workers_raw.iter().map(|w| w.url().to_string()).collect();
+        let mut filtered_workers = workers_raw;
+        // 强制排序
+        filtered_workers.sort_by(|a, b| a.url().cmp(b.url()));
+        // 记录排序结果
+        let sorted: Vec<String> = filtered_workers.iter().map(|w| w.url().to_string()).collect();
+        if !sorted.is_empty() {
+            tracing::debug!("Filtered Workers: Raw={:?} -> Sorted={:?}", raw, sorted);
+        }
+
+        filtered_workers
     }
 
     /// Get worker statistics (lock-free)
