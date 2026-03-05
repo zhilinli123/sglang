@@ -457,6 +457,7 @@ impl PDRouter {
                 prefill,
                 decode,
             )
+            .await
         } else {
             // Handle non-streaming error response
             match res.bytes().await {
@@ -649,6 +650,7 @@ impl PDRouter {
                         prefill,
                         decode,
                     )
+                    .await
                 } else {
                     // Non-streaming response
                     if context.return_logprob {
@@ -831,10 +833,10 @@ impl PDRouter {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create_streaming_response(
+    async fn create_streaming_response(
         &self,
-        stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
-        status: StatusCode,
+        mut stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + Unpin + 'static,
+        initial_status: StatusCode,
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         decode_url: Option<String>,
@@ -843,18 +845,132 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
     ) -> Response {
         use crate::core::AttachedBody;
+        // 适配 MiniLB 行为：流式响应中强制禁用 logprob 合并
+        let return_logprob = false;
 
+        // 1. Pre-validate first chunk (similar to mini_lb_v2.py)
+        let first_chunk = match stream.next().await {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(e)) => {
+                error!("Failed to receive first chunk from decode server: {}", e);
+                return error::internal_error(
+                    "stream_first_chunk_error",
+                    format!("Failed to receive first chunk: {}", e),
+                );
+            }
+            None => {
+                error!("No data chunks received from decode server");
+                return error::internal_error(
+                    "stream_no_chunks",
+                    "No data chunks received from decode server",
+                );
+            }
+        };
+
+        // 2. Validate first chunk content
+        let chunk_str = match std::str::from_utf8(&first_chunk) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("First chunk is not valid UTF-8: {}", e);
+                return error::internal_error(
+                    "stream_invalid_utf8",
+                    "First chunk is not valid UTF-8",
+                );
+            }
+        };
+
+        // 3. Check if first chunk is [DONE] (should not happen)
+        let trimmed = chunk_str.trim();
+        if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
+            error!("First chunk is [DONE]");
+            return error::internal_error(
+                "stream_first_chunk_done",
+                "First chunk is [DONE]",
+            );
+        }
+
+        // 4. Extract data from SSE format and check if empty
+        let data_str = if chunk_str.starts_with("data: ") {
+            chunk_str[6..].trim()
+        } else {
+            chunk_str.trim()
+        };
+
+        if data_str.is_empty() {
+            error!("First chunk is empty");
+            return error::internal_error(
+                "stream_empty_chunk",
+                "First chunk is empty",
+            );
+        }
+
+        // 5. Parse JSON and extract status code dynamically (similar to mini_lb_v2.py)
+        let actual_status = match serde_json::from_str::<Value>(data_str) {
+            Ok(json) => {
+                // Check if this is an error response
+                if json.get("object").and_then(|v| v.as_str()) == Some("error") {
+                    let code = json
+                        .get("code")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(500) as u16;
+                    debug!("First chunk contains error with code: {}", code);
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+                } else if let Some(error_obj) = json.get("error") {
+                    let code = error_obj
+                        .get("code")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(500) as u16;
+                    debug!("First chunk contains error object with code: {}", code);
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+                } else {
+                    // Normal response, use initial status
+                    initial_status
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to parse first chunk as JSON (continuing with initial status): {}",
+                    e
+                );
+                initial_status
+            }
+        };
+
+        debug!(
+            "First chunk validated successfully, status: {}, preview: {}",
+            actual_status,
+            &chunk_str.chars().take(100).collect::<String>()
+        );
+
+        // 6. Create channel for streaming
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
+        // Clone values for the spawned task
+        let decode_url_clone = decode_url.clone();
+        let prefill_logprobs_clone = prefill_logprobs.clone();
+
+        // 7. Spawn task to process remaining chunks
         tokio::spawn(async move {
-            futures_util::pin_mut!(stream);
+            // First, send the validated first chunk
+            let first_result = if return_logprob && prefill_logprobs_clone.is_some() {
+                Self::merge_streaming_logprobs(prefill_logprobs_clone.clone(), &first_chunk)
+                    .unwrap_or(first_chunk.clone())
+            } else {
+                first_chunk
+            };
+
+            if tx.send(Ok(first_result)).is_err() {
+                return;
+            }
+
+            // Then process remaining chunks
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
                         let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
 
-                        let result = if return_logprob && prefill_logprobs.is_some() {
-                            Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
+                        let result = if return_logprob && prefill_logprobs_clone.is_some() {
+                            Self::merge_streaming_logprobs(prefill_logprobs_clone.clone(), &chunk)
                                 .unwrap_or(chunk)
                         } else {
                             chunk
@@ -869,7 +985,7 @@ impl PDRouter {
                         }
                     }
                     Err(e) => {
-                        if let Some(ref url) = decode_url {
+                        if let Some(ref url) = decode_url_clone {
                             error!("Stream error from decode server {}: {}", url, e);
                         }
                         let _ = tx.send(Err(format!("Stream error: {}", e)));
@@ -888,7 +1004,7 @@ impl PDRouter {
         ];
 
         let mut response = Response::new(body);
-        *response.status_mut() = status;
+        *response.status_mut() = actual_status;
 
         let mut response_headers = headers.unwrap_or_default();
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
@@ -1281,6 +1397,16 @@ impl RouterTrait for PDRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        // 与 mini_lb.py 对齐：强制要求 n 参数必须为 1（如果存在）
+        if let Some(n) = body.n {
+            if n != 1 {
+                return error::bad_request(
+                    "invalid_n_parameter",
+                    "Not support n != 1.",
+                );
+            }
+        }
+
         let is_stream = body.stream;
         let return_logprob = body.logprobs;
 
@@ -1542,23 +1668,30 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
 
+        // Send a valid first chunk before creating the streaming response
+        tx.send(bytes::Bytes::from(
+            r#"data: {"id":"test","object":"chat.completion.chunk","choices":[]}"#,
+        ))
+        .unwrap();
+
         {
             let response = router.create_streaming_response(
-                stream.map(Ok),
-                StatusCode::OK,
-                None,
-                false,
-                None,
-                None,
-                prefill_ref.clone(),
-                decode_ref.clone(),
-            );
+                    stream.map(Ok),
+                    StatusCode::OK,
+                    None,
+                    false,
+                    None,
+                    None,
+                    prefill_ref.clone(),
+                    decode_ref.clone(),
+                )
+                .await;
 
             // Guards are now attached to response body, so load should be 1
             assert_eq!(prefill_ref.load(), 1);
             assert_eq!(decode_ref.load(), 1);
 
-            tx.send(bytes::Bytes::from("test data")).unwrap();
+            tx.send(bytes::Bytes::from("data: test data\n\n")).unwrap();
 
             sleep(Duration::from_millis(10)).await;
 

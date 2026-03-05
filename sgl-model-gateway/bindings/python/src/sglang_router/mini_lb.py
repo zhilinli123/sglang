@@ -2,18 +2,20 @@
 Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
+import os
 import asyncio
 import ipaddress
 import logging
 import random
 import urllib
-import warnings
 from http import HTTPStatus
 from itertools import chain
 from typing import Optional
+import traceback
 
 import aiohttp
 import orjson
+from aiorwlock import RWLock
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -34,7 +36,25 @@ try:
 except ImportError:
     trace_package_imported = False
 
+# 从环境变量获取日志级别
+log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# 配置日志格式
+logging.basicConfig(
+    level=getattr(logging, log_level, logging.INFO),
+    format='[%(asctime)s] %(levelname)s:     %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
 logger = logging.getLogger(__name__)
+
+def str_to_bool(value, default_value=False):
+    if value.lower() in ('1', 'true', 't', 'yes', 'y'):
+        return True
+    elif value.lower() in ('0', 'false', 'f', 'no', 'n'):
+        return False
+    return default_value
+SGLANG_LB_LOG_EACH_CHUNK = str_to_bool(os.getenv("SGLANG_LB_LOG_EACH_CHUNK", "0"), False)
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
@@ -69,10 +89,10 @@ class MiniLoadBalancer:
                 "Tracing is not supported in this environment. Please install sglang."
             )
             self.enable_trace = False
-
-        self.test_external_dp_routing = router_args.test_external_dp_routing
-        self.prefill_dp_size = None
-        self.decode_dp_size = None
+        # 添加轮询索引和读写锁
+        self._prefill_index = 0
+        self._decode_index = 0
+        self._rw_lock = RWLock()
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
@@ -98,59 +118,92 @@ class MiniLoadBalancer:
         if self.enable_trace:
             process_tracing_init(self.otlp_traces_endpoint, "sglang")
             trace_set_thread_info("Mini lb")
-        uvicorn.run(app, host=self.host, port=self.port)
-
-    async def _ensure_dp_sizes(self):
-        if self.prefill_dp_size is not None:
-            return
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self.prefill_urls[0]}/server_info") as resp:
-                info = await resp.json()
-                self.prefill_dp_size = len(info.get("internal_states", [1]))
-            async with session.get(f"{self.decode_urls[0]}/server_info") as resp:
-                info = await resp.json()
-                self.decode_dp_size = len(info.get("internal_states", [1]))
-        logger.info(
-            f"[MiniLB] DP sizes: prefill={self.prefill_dp_size}, decode={self.decode_dp_size}"
+            # 添加日志配置
+        uvicorn.run(
+            app,
+            host=self.host,
+            port=self.port,
+            log_config={
+                "version": 1,
+                "disable_existing_loggers": False,
+                "formatters": {
+                    "default": {
+                        "()": "uvicorn.logging.DefaultFormatter",
+                        "fmt": "%(levelprefix)s %(message)s",
+                        "use_colors": None,
+                    },
+                    "access": {
+                        "()": "uvicorn.logging.AccessFormatter",
+                        "fmt": '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',  # noqa: E501
+                        "datefmt": "%Y-%m-%d %H:%M:%S",
+                    },
+                },
+                "handlers": {
+                    "default": {
+                        "formatter": "default",
+                        "class": "logging.StreamHandler",
+                        "stream": "ext://sys.stderr",
+                    },
+                    "access": {
+                        "formatter": "access",
+                        "class": "logging.StreamHandler",
+                        "stream": "ext://sys.stdout",
+                    },
+                },
+                "loggers": {
+                    "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
+                    "uvicorn.error": {"level": "INFO"},
+                    "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
+                },
+            }
         )
 
-    def _fork_dp_requests(self, request):
-        p_rank = random.randint(0, self.prefill_dp_size - 1)
-        d_rank = random.randint(0, self.decode_dp_size - 1)
+    async def select_pair(self):
+        # 使用写锁，因为需要更新索引
+        async with self._rw_lock.writer:
+            if len(self.prefill_urls) == 0:
+                raise Exception("No prefill servers available")
+            if len(self.decode_urls) == 0:
+                raise Exception("No decode servers available")
 
-        prefill_req = request.copy()
-        decode_req = request.copy()
-        prefill_req["routed_dp_rank"] = p_rank
-        decode_req["routed_dp_rank"] = d_rank
-        decode_req["disagg_prefill_dp_rank"] = p_rank
+            # 轮询选择 prefill 服务器
+            self._prefill_index %= len(self.prefill_urls)
+            prefill_url = self.prefill_urls[self._prefill_index]
+            bootstrap_port = self.prefill_bootstrap_ports[self._prefill_index]
+            # 更新索引
+            self._prefill_index = (self._prefill_index + 1) % len(self.prefill_urls)
 
-        return prefill_req, decode_req, d_rank
+            # 轮询选择 decode 服务器
+            self._decode_index %= len(self.decode_urls)
+            decode_url = self.decode_urls[self._decode_index]
+            # 更新索引
+            self._decode_index = (self._decode_index + 1) % len(self.decode_urls)
 
-    def select_pair(self):
-        assert len(self.prefill_urls) > 0, "No prefill servers available"
-        assert len(self.decode_urls) > 0, "No decode servers available"
-        pidx = random.randint(0, len(self.prefill_urls) - 1)
-        didx = random.randint(0, len(self.decode_urls) - 1)
-        return (
-            self.prefill_urls[pidx],
-            self.prefill_bootstrap_ports[pidx],
-            self.decode_urls[didx],
-        )
+            logger.info(
+                f"Selected pair: prefill={prefill_url}, decode={decode_url}"
+            )
+            return prefill_url, bootstrap_port, decode_url
+
 
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
     ) -> ORJSONResponse:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
-        expected_decode_dp_rank = None
-        if self.test_external_dp_routing:
-            await self._ensure_dp_sizes()
-            prefill_req, decode_req, expected_decode_dp_rank = self._fork_dp_requests(
-                modified_request
-            )
-        else:
-            prefill_req = modified_request
-            decode_req = modified_request
+        # 检查 n 参数必须为 1
+        if modified_request.get("n") is not None:
+            n = modified_request.get("n")
+            if not isinstance(n, int) or n != 1:
+                return ORJSONResponse(
+                    content={
+                        "object": "error",
+                        "message": "Not support n != 1.",
+                        "type": "BadRequestError",
+                        "param": None,
+                        "code": 400
+                    },
+                    status_code=400,
+                )
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
@@ -171,12 +224,12 @@ class MiniLoadBalancer:
             tasks = [
                 session.post(
                     f"{prefill_server}/{endpoint}",
-                    json=prefill_req,
+                    json=modified_request,
                     headers=headers,
                 ),
                 session.post(
                     f"{decode_server}/{endpoint}",
-                    json=decode_req,
+                    json=modified_request,
                     headers=headers,
                 ),
             ]
@@ -210,16 +263,6 @@ class MiniLoadBalancer:
                 )
                 trace_req_finish(bootstrap_room)
 
-            if expected_decode_dp_rank is not None:
-                actual = ret_json.get("meta_info", {}).get("dp_rank")
-                if actual != expected_decode_dp_rank:
-                    return ORJSONResponse(
-                        content={
-                            "error": f"DP rank mismatch: expected {expected_decode_dp_rank}, got {actual}"
-                        },
-                        status_code=500,
-                    )
-
             return ORJSONResponse(
                 content=ret_json,
                 status_code=decode_response.status,
@@ -228,17 +271,14 @@ class MiniLoadBalancer:
     async def generate_stream(
         self, modified_request, prefill_server, decode_server, endpoint="generate"
     ):
-
-        if self.test_external_dp_routing:
-            warnings.warn("--test-external-dp-routing is not supported with streaming")
-
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
+
+        # 设置 return_logprob 永远为 False
+        modified_request["return_logprob"] = False
 
         async def stream_results():
             async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(
-                    total=self.timeout
-                )  # Add timeout for request reliability
+                timeout=aiohttp.ClientTimeout(total=self.timeout)
             ) as session:
                 # Create the tasks for both prefill and decode requests
                 headers = {}
@@ -271,44 +311,66 @@ class MiniLoadBalancer:
                     trace_slice_end(
                         "mini_lb_launch", bootstrap_room, auto_next_anon=True
                     )
-                # Wait for both responses to complete. Since this is streaming, they return immediately.
+                # Wait for both responses to complete
                 prefill_response, decode_response = await asyncio.gather(*tasks)
 
-                if modified_request.get("return_logprob", False):
-                    prefill_chunks = []
-                    async for chunk in prefill_response.content:
-                        prefill_chunks.append(chunk)
+                # 尝试获取第一个chunk
+                first_chunk_bytes_received = False
+                async for chunk_bytes in decode_response.content:
+                    if not first_chunk_bytes_received:
+                        first_chunk_bytes_received = True
 
-                    first_prefill_chunk = (
-                        prefill_chunks[0].decode("utf-8")[5:].strip("\n")
-                    )
-                    first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
+                        # 检查第一个chunk的内容
+                        first_chunk_str = chunk_bytes.decode('utf-8')
 
-                    async for chunk in decode_response.content:
-                        # Note: This is inefficient
-                        # merge prefill input_token_logprobs, output_token_logprobs to decode
-                        decoded_chunk = chunk.decode("utf-8")
-                        if (
-                            decoded_chunk
-                            and decoded_chunk.startswith("data:")
-                            and "[DONE]" not in decoded_chunk
-                        ):
-                            ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
-                            ret_json["meta_info"]["input_token_logprobs"] = (
-                                first_prefill_chunk_json["meta_info"][
-                                    "input_token_logprobs"
-                                ]
-                                + ret_json["meta_info"]["input_token_logprobs"]
-                            )
+                        # 记录 prefill 和 decode 服务器信息
+                        logger.info(f"Streaming from {prefill_server=}, {decode_server=}, {first_chunk_str=}")
 
-                            yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
+                        # 如果第一个chunk是 [DONE]，抛出异常
+                        if (first_chunk_str.strip() == "data: [DONE]") or (first_chunk_str.strip() == "[DONE]"):
+                            raise Exception("First chunk is [DONE]")
+
+                        # 移除可能的 "data: " 前缀
+                        if first_chunk_str.startswith("data: "):
+                            data_str = first_chunk_str[6:].strip()
                         else:
-                            yield chunk
-                else:
-                    async for chunk in decode_response.content.iter_chunked(
-                        AIOHTTP_STREAM_READ_CHUNK_SIZE
-                    ):
-                        yield chunk
+                            data_str = first_chunk_str.strip()
+
+                        # 如果为空数据，抛出异常
+                        if not data_str:
+                            raise Exception("Empty first chunk")
+
+                        # 解析JSON数据
+                        try:
+                            data = orjson.loads(data_str)
+
+                            # 检查是否是错误响应
+                            if data.get("object") == "error":
+                                status_code = data.get("code", 500)
+                                yield status_code, chunk_bytes
+                                break
+
+                            if data.get("error") != None:
+                                status_code = data.get("error").get("code", 500)
+                                yield status_code, chunk_bytes
+                                break
+
+                        except Exception as e:
+                            raise Exception(f"Failed to parse first chunk: {str(e)}. First chunk is {first_chunk_str}")
+
+                        # 第一次返回状态码和chunk
+                        yield decode_response.status, chunk_bytes
+                        break  # 只检查第一个chunk
+
+                # 如果未成功接收第一个chunk，抛出异常
+                if not first_chunk_bytes_received:
+                    raise Exception("No data chunks received from decode server")
+
+                # 后续只返回chunk
+                async for chunk_bytes in decode_response.content.iter_chunked(
+                    AIOHTTP_STREAM_READ_CHUNK_SIZE
+                ):
+                    yield chunk_bytes
 
             for bootstrap_room in bootstrap_room_list:
                 trace_slice_end(
@@ -318,10 +380,39 @@ class MiniLoadBalancer:
                 )
                 trace_req_finish(bootstrap_room)
 
-        return StreamingResponse(
-            stream_results(),
-            media_type="text/event-stream",
-        )
+        try:
+            # 尝试获取第一个chunk以确保连接正常
+            stream_iterator = stream_results()
+            first_result = await stream_iterator.__anext__()
+
+            # 处理第一次返回的两个对象
+            status_code, first_chunk_bytes = first_result
+
+            async def full_stream():
+                yield first_chunk_bytes
+
+                # 处理后续只返回chunk的情况
+                async for chunk_bytes in stream_iterator:
+                    # 根据环境变量控制是否记录每个chunk
+                    if SGLANG_LB_LOG_EACH_CHUNK:
+                        logger.info(f"Chunk: {chunk_bytes}")
+                    yield chunk_bytes
+
+            return StreamingResponse(
+                full_stream(),
+                media_type="text/event-stream",
+                status_code=status_code
+            )
+        except Exception as e:
+            logger.error(f"Error in stream generation: {e}")
+            traceback.print_exc()
+            return StreamingResponse(
+                iter([b""]),
+                media_type="text/event-stream",
+                status_code=500
+            )
+
+
 
 
 app = FastAPI()
@@ -441,7 +532,7 @@ async def get_model_info():
 
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
+    prefill_server, bootstrap_port, decode_server = await lb.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
@@ -479,7 +570,7 @@ async def handle_generate_request(request_data: dict):
 
 
 async def _forward_to_backend(request_data: dict, endpoint_name: str):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
+    prefill_server, bootstrap_port, decode_server = await lb.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
