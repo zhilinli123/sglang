@@ -1,79 +1,77 @@
 ######################## BASE IMAGE ##########################
-FROM python:3.12-slim AS base
+FROM ubuntu:24.04 AS base
 
 ARG PYTHON_VERSION=3.12
 
-# 设置环境变量
-ENV PATH="/root/.local/bin:/opt/venv/bin:${PATH}"
+# set the environment variables
+ENV PATH="/root/.local/bin:${PATH}"
 ENV DEBIAN_FRONTEND=noninteractive
+
+# uv environment variables
+ENV UV_HTTP_TIMEOUT=500
 ENV VIRTUAL_ENV="/opt/venv"
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+ENV UV_LINK_MODE="copy"
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# [严谨审核 1] 彻底切换 APT 源，并安装 git (必须) 和编译必备组件
-RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources \
-    && apt update -y \
-    && apt install -y curl git build-essential libssl-dev pkg-config protobuf-compiler \
-    && python -m venv $VIRTUAL_ENV \
-    && $VIRTUAL_ENV/bin/pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple \
-    && rm -rf /var/lib/apt/lists/*
 
-# [严谨审核 2] 改用 pip 安装 uv，避开 astral.sh 网络波动
-RUN $VIRTUAL_ENV/bin/pip install uv -i https://pypi.tuna.tsinghua.edu.cn/simple
+# install dependencies
+RUN apt update -y \
+    && apt install -y curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt clean
 
-######################## LOCAL SOURCE ##########################
+# install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# install python
+RUN uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV}
+
 FROM scratch AS local_src
 COPY . /src
 
 ######################### BUILD IMAGE #########################
 FROM base AS build-image
 
-# [严谨审核 3] 设置 Rustup 环境变量
-ENV RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
-ENV RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
+# set the environment variables
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# [严谨审核 4] 确定性安装 Rust，绕过 sh.rustup.rs
-RUN set -eux; \
-    arch="$(uname -m)"; \
-    case "$arch" in \
-        x86_64) rust_arch='x86_64-unknown-linux-gnu' ;; \
-        aarch64) rust_arch='aarch64-unknown-linux-gnu' ;; \
-        *) echo "Unsupported architecture: $arch"; exit 1 ;; \
-    esac; \
-    url="https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup/dist/${rust_arch}/rustup-init"; \
-    curl -sSfL "$url" -o rustup-init; \
-    chmod +x rustup-init; \
-    ./rustup-init -y --no-modify-path --default-toolchain stable; \
-    rm rustup-init; \
-    rustc --version
+# install dependencies
+RUN apt update -y \
+    && apt install -y git build-essential libssl-dev pkg-config protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt clean
 
-# 拷贝源代码
+# install rustup from rustup.rs
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && rustc --version && cargo --version && protoc --version
+
+# copy source code
 COPY --from=local_src /src /opt/sglang
+
+# working directory
 WORKDIR /opt/sglang/sgl-model-gateway
 
-# [严谨审核 5] Cargo 全局配置：
-# 1. 替换 crates.io 源
-# 2. 强制使用系统 git (解决 harmony 下载失败的关键)
-# 3. 禁用 git 进度条减小日志压力
-RUN mkdir -p /root/.cargo && \
-    printf '[source.crates-io]\nreplace-with = "ustc"\n\n[source.ustc]\nregistry = "https://mirrors.ustc.edu.cn/crates.io-index"\n\n[net]\ngit-fetch-with-cli = true\nretry = 3\n' > /ro
-ot/.cargo/config.toml
-
-# [严谨审核 6] 设置编译环境变量，确保 maturin 使用 vendored-openssl 提高兼容性
-ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
-
-# 执行编译：使用 --frozen 确保不进行意外的网络索引更新（如果 Cargo.lock 完整）
-RUN uv pip install maturin -i https://pypi.tuna.tsinghua.edu.cn/simple \
+# install maturin and build the wheel with vendored OpenSSL
+RUN uv pip install maturin \
     && cargo clean \
     && rm -rf bindings/python/dist/ \
     && cd bindings/python \
-    && ulimit -n 65536 \
-    && maturin build --release --features vendored-openssl --out dist \
+    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
     && rm -rf /root/.cache
 
 ######################### ROUTER IMAGE #########################
 FROM base AS router-image
+
+# Copy the built package from the build image
 COPY --from=build-image /opt/sglang/sgl-model-gateway/bindings/python/dist/*.whl dist/
-RUN uv pip install --force-reinstall dist/*.whl -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# Build the package and install
+RUN uv pip install --force-reinstall dist/*.whl
+
+# Clean up unnecessary files to reduce the image size
 RUN rm -rf /root/.cache dist/ \
-    && apt purge -y --auto-remove curl git
+    && apt purge -y --auto-remove curl
+
+# Set the entrypoint to the main command
 ENTRYPOINT ["python3", "-m", "sglang_router.launch_router"]
