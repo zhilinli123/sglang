@@ -74,5 +74,5 @@ FROM base AS router-image
 COPY --from=build-image /opt/sglang/sgl-model-gateway/bindings/python/dist/*.whl dist/
 RUN uv pip install --force-reinstall dist/*.whl -i https://pypi.tuna.tsinghua.edu.cn/simple
 RUN rm -rf /root/.cache dist/ \
-    && apt purge -y --auto-remove curl git
+    && apt purge -y --auto-remove git
 ENTRYPOINT ["python3", "-m", "sglang_router.launch_router"]
