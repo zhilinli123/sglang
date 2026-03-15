@@ -1,0 +1,74 @@
+[workspace]
+members = ["model_gateway", "protocols", "reasoning_parser", "tool_parser", "workflow", "tokenizer", "auth", "mcp", "kv_index", "data_connector", "multimodal", "wasm", "mesh", "grpc_client"]
+exclude = ["bindings/python", "bindings/golang"]
+resolver = "2"
+
+[workspace.dependencies]
+openai-protocol = { path = "protocols" }
+smg-auth = { path = "auth", package = "auth" }
+smg-mcp = { path = "mcp" }
+smg-data-connector = { path = "data_connector", package = "data-connector" }
+smg-wasm = { path = "wasm", package = "smg-wasm" }
+smg-mesh = { path = "mesh", package = "smg-mesh" }
+smg-grpc-client = { path = "grpc_client" }
+
+# Shared dependencies
+anyhow = "1.0"
+async-trait = "0.1"
+futures = "0.3"
+prost = "0.14.1"
+prost-types = "0.14.1"
+tonic = { version = "0.14.2", features = ["gzip", "transport"] }
+tonic-prost = "0.14.2"
+axum = { version = "0.8.6" }
+blake3 = "1.5"
+bytemuck = { version = "1.21" }
+chrono = { version = "0.4" }
+dashmap = "6.1.0"
+http = "1.1.0"
+lru = "0.16.2"
+num-traits = "0.2"
+parking_lot = "0.12.4"
+rand = "0.9.2"
+reqwest = { version = "0.12.8", default-features = false }
+serde = { version = "1.0" }
+serde_json = "1.0"
+subtle = "2.6"
+thiserror = "2.0.12"
+tokio = { version = "1.42.0" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
+uuid = { version = "1.10" }
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = "fat"         # Full LTO for smaller binaries
+codegen-units = 1   # Better optimization, slower compile
+strip = true        # Strip debug symbols
+
+[profile.ci]
+inherits = "release"
+opt-level = 2       # Lighter optimization (still fast runtime, much faster compile)
+lto = "thin"        # Thin LTO - good balance
+codegen-units = 16  # More parallelization for faster builds
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = 1
+split-debuginfo = "unpacked"
+incremental = true
+codegen-units = 256
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+
+[profile.dev.build-override]
+opt-level = 3
+codegen-units = 1
+
+[profile.dev-opt]
+inherits = "dev"
+opt-level = 1

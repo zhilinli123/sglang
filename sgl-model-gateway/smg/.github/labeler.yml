@@ -1,0 +1,90 @@
+# Label configuration for actions/labeler
+# See: https://github.com/actions/labeler
+
+python-bindings:
+  - changed-files:
+      - any-glob-to-any-file: 'bindings/python/**/*'
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*.md'
+          - 'docs/**/*'
+          - 'mkdocs.yml'
+
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/Cargo.toml'
+          - '**/Cargo.lock'
+          - '**/pyproject.toml'
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file: '.github/**/*'
+
+docker:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'docker/**/*'
+          - '**/Dockerfile'
+
+grpc:
+  - changed-files:
+      - any-glob-to-any-file: 'grpc_client/**/*'
+
+mcp:
+  - changed-files:
+      - any-glob-to-any-file: 'mcp/**/*'
+
+tokenizer:
+  - changed-files:
+      - any-glob-to-any-file: 'tokenizer/**/*'
+
+tool-parser:
+  - changed-files:
+      - any-glob-to-any-file: 'tool_parser/**/*'
+
+reasoning-parser:
+  - changed-files:
+      - any-glob-to-any-file: 'reasoning_parser/**/*'
+
+wasm:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'wasm/**/*'
+          - 'model_gateway/src/wasm/**/*'
+
+auth:
+  - changed-files:
+      - any-glob-to-any-file: 'auth/**/*'
+
+data-connector:
+  - changed-files:
+      - any-glob-to-any-file: 'data_connector/**/*'
+
+multimodal:
+  - changed-files:
+      - any-glob-to-any-file: 'multimodal/**/*'
+
+protocols:
+  - changed-files:
+      - any-glob-to-any-file: 'protocols/**/*'
+
+workflow:
+  - changed-files:
+      - any-glob-to-any-file: 'workflow/**/*'
+
+model-gateway:
+  - changed-files:
+      - any-glob-to-any-file: 'model_gateway/**/*'
+
+benchmarks:
+  - changed-files:
+      - any-glob-to-any-file: 'model_gateway/benches/**/*'
+
+tests:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'e2e_test/**/*'
+          - '**/tests/**/*'

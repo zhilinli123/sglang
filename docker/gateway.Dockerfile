@@ -48,14 +48,17 @@ RUN set -eux; \
 
 # 拷贝源代码
 COPY --from=local_src /src /opt/sglang
+# 删除 macOS AppleDouble 隐藏文件（._* 文件含非 UTF-8 内容，会导致 wasmtime bindgen 解析 WIT 失败）
+RUN find /opt/sglang -name '._*' -delete
 WORKDIR /opt/sglang/sgl-model-gateway
 
 # [严谨审核 5] Cargo 全局配置：
-# 1. 替换 crates.io 源
-# 2. 强制使用系统 git (解决 harmony 下载失败的关键)
-# 3. 禁用 git 进度条减小日志压力
+# 1. 主用 rsproxy sparse 索引（字节跳动，覆盖最全，含 sketches-ddsketch 等）
+# 2. 保留 ustc 备用
+# 3. 强制使用系统 git (解决 harmony 下载失败的关键)
+# 4. 增大超时至 600s，重试 5 次，解决偶发下载超时
 RUN mkdir -p /root/.cargo && \
-    printf '[source.crates-io]\nreplace-with = "ustc"\n\n[source.ustc]\nregistry = "https://mirrors.ustc.edu.cn/crates.io-index"\n\n[net]\ngit-fetch-with-cli = true\nretry = 3\n' > /root/.cargo/config.toml
+    printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n\n[source.rsproxy]\nregistry = "https://rsproxy.cn/crates.io-index"\n\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n\n[source.ustc]\nregistry = "https://mirrors.ustc.edu.cn/crates.io-index"\n\n[net]\ngit-fetch-with-cli = true\nretry = 5\n\n[http]\ntimeout = 600\ncheck-revoke = false\n' > /root/.cargo/config.toml
 
 # [严谨审核 6] 设置编译环境变量，确保 maturin 使用 vendored-openssl 提高兼容性
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
