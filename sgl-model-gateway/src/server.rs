@@ -185,7 +185,7 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    mut Json(mut body): Json<ChatCompletionRequest>,
+    Json(mut body): Json<ChatCompletionRequest>,
 ) -> Response {
     // Keep protocol-level normalization behavior consistent with ValidatedJson.
     body.normalize();
