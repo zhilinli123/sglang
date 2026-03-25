@@ -293,6 +293,47 @@ mod generation_tests {
 
         ctx.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn test_v1_chat_completions_accepts_stream_options_when_non_streaming() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18105,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "Hello!"}
+            ],
+            "stream": false,
+            "stream_options": {"include_usage": true}
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body_json.get("choices").is_some());
+
+        ctx.shutdown().await;
+    }
 }
 
 #[cfg(test)]

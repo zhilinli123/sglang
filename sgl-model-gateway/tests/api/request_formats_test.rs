@@ -101,6 +101,33 @@ mod request_format_tests {
         let result = ctx.make_request("/v1/chat/completions", payload).await;
         assert!(result.is_ok());
 
+        // Compatibility: stream=false should accept any supported stream_options shape.
+        let payloads = vec![
+            json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": false,
+                "stream_options": {"include_usage": true}
+            }),
+            json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": false,
+                "stream_options": {"include_usage": false}
+            }),
+            json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": false,
+                "stream_options": {}
+            }),
+        ];
+
+        for payload in payloads {
+            let result = ctx.make_request("/v1/chat/completions", payload).await;
+            assert!(result.is_ok());
+        }
+
         ctx.shutdown().await;
     }
 

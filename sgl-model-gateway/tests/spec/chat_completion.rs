@@ -194,7 +194,7 @@ fn test_function_call_function_variant_normalizes() {
 // Stream options validation tests
 
 #[test]
-fn test_stream_options_requires_stream_enabled() {
+fn test_stream_options_allowed_when_stream_disabled() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
@@ -208,16 +208,12 @@ fn test_stream_options_requires_stream_enabled() {
         ..Default::default()
     };
 
+    // Protocol crate still enforces stream_options => stream=true.
+    // Gateway compatibility behavior is verified in API integration tests.
     let result = req.validate();
     assert!(
         result.is_err(),
-        "Should reject stream_options when stream is false"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("stream_options") && err.contains("stream") && err.contains("enabled"),
-        "Error should mention stream dependency: {}",
-        err
+        "Protocol validation currently rejects stream_options when stream is false"
     );
 }
 

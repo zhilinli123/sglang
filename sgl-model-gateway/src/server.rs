@@ -16,6 +16,7 @@ use axum::{
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use validator::Validate;
 use smg_mesh::{
     rate_limit_window::RateLimitWindow, MeshServerConfig, MeshServerHandler, MeshSyncManager,
 };
@@ -49,7 +50,7 @@ use crate::{
         rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-        validated::ValidatedJson,
+        validated::{Normalizable, ValidatedJson},
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
@@ -184,8 +185,22 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    mut Json(mut body): Json<ChatCompletionRequest>,
 ) -> Response {
+    // Keep protocol-level normalization behavior consistent with ValidatedJson.
+    body.normalize();
+
+    // Compatibility shim:
+    // accept stream_options even when stream=false by dropping stream_options
+    // before protocol-layer validation.
+    if !body.stream && body.stream_options.is_some() {
+        body.stream_options = None;
+    }
+
+    if let Err(err) = body.validate() {
+        return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+    }
+
     state
         .router
         .route_chat(Some(&headers), &body, Some(&body.model))
