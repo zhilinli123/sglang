@@ -16,6 +16,7 @@ use axum::{
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use validator::Validate;
 use smg_mesh::{
     rate_limit_window::RateLimitWindow, MeshServerConfig, MeshServerHandler, MeshSyncManager,
 };
@@ -49,7 +50,7 @@ use crate::{
         rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-        validated::ValidatedJson,
+        validated::{Normalizable, ValidatedJson},
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
@@ -184,8 +185,35 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    Json(mut raw_body): Json<Value>,
 ) -> Response {
+    if let Some(obj) = raw_body.as_object_mut() {
+        let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !stream {
+            obj.remove("stream_options");
+        }
+    }
+
+    let Ok(mut body) = serde_json::from_value::<ChatCompletionRequest>(raw_body) else {
+        return (StatusCode::BAD_REQUEST, "Invalid JSON body").into_response();
+    };
+
+    body.normalize();
+
+    if let Err(e) = body.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": e.to_string(),
+                    "type": "invalid_request_error",
+                    "code": 400
+                }
+            })),
+        )
+            .into_response();
+    }
+
     state
         .router
         .route_chat(Some(&headers), &body, Some(&body.model))

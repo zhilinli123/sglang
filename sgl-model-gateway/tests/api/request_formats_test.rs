@@ -101,6 +101,32 @@ mod request_format_tests {
         let result = ctx.make_request("/v1/chat/completions", payload).await;
         assert!(result.is_ok());
 
+        // Compatibility: stream=false should tolerate stream_options without returning 400.
+        let payload = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "你是什么模型"}
+            ],
+            "stream": false,
+            "stream_options": {"include_usage": true}
+        });
+
+        let result = ctx.make_request("/v1/chat/completions", payload).await;
+        assert!(result.is_ok());
+
+        // Compatibility: stream=false should also tolerate additional non-standard keys.
+        let payload = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "你好"}
+            ],
+            "stream": false,
+            "stream_options": {"include_usage": true, "chunk_usage": true}
+        });
+
+        let result = ctx.make_request("/v1/chat/completions", payload).await;
+        assert!(result.is_ok());
+
         ctx.shutdown().await;
     }
 
